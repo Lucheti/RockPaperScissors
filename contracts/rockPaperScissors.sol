@@ -1,129 +1,270 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.4.0;
+pragma solidity >=0.4.22 <0.9.0;
 
-contract RockPaperScissorsGame {
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
-    address[] public instances;
+contract RPSGame is Ownable {
 
-    function count() public constant returns(unit count) {
-        return instances.length;
+
+
+    // ~~~~~~~~ State ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    using SafeMath for uint;
+
+    uint public BET_MIN = 1 wei;
+    uint SECOND_PLAY_TIMEOUT = 1 minutes;
+    uint FIRST_PLAY_TIMEOUT = 1 hours;
+
+    bool matchCreationEnabled = true;
+
+    function updateMatchCreationStatus(bool matchCreationMode) public onlyOwner {
+        matchCreationEnabled = matchCreationMode;
     }
 
-    function create() public returns(address instance) {
-        RockPaperScissorsInstance instance = new RockPaperScissorsInstance();
-        instances.push(instance);
-        return instance;
+    mapping(uint => OpenMatch) betToOpenMatch;
+    RPSMatch[] public matches;
+
+
+
+    // ~~~~~~~~ Init ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    constructor() Ownable(){}
+
+
+
+    // ~~~~~~~~ Events ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    event OpenedMatch(OpenMatch openMatch);
+    event OpenMatchCanceled(uint value);
+    event MatchCreated(uint index, address game);
+
+
+
+    // ~~~~~~~~ Mods ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    modifier validBet() {
+        require(msg.value >= BET_MIN, "Min bet is set to be at least 1 wei");
+        _;
     }
+
+    modifier canCreateMatch() {
+        require(matchCreationEnabled, "Match creation disabled");
+        _;
+    }
+
+    modifier isGameOwner(uint _value) {
+        require(betToOpenMatch[_value].player1 == payable(msg.sender), "User is not the owner of the OpenGame");
+        _;
+    }
+
+
+
+    // ~~~~~~~~ Functions ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    function newMatch() public payable validBet canCreateMatch {
+        if (betToOpenMatch[msg.value].bet != 0) {
+            OpenMatch memory openMatch = betToOpenMatch[msg.value];
+            uint index = matches.length;
+            RPSMatch newGame = new RPSMatch(index, openMatch.player1, payable(msg.sender), block.timestamp + FIRST_PLAY_TIMEOUT, SECOND_PLAY_TIMEOUT, msg.value);
+            payable(address(newGame)).transfer(msg.value.add(openMatch.bet));
+            matches.push(newGame);
+            emit MatchCreated(index, address(newGame));
+            delete betToOpenMatch[msg.value];
+        }
+        else {
+            OpenMatch memory openMatch = OpenMatch(payable(msg.sender), msg.value);
+            betToOpenMatch[msg.value] = openMatch;
+            emit OpenedMatch(openMatch);
+        }
+    }
+
+    function cancel(uint _value) public isGameOwner(_value) {
+        OpenMatch memory om = betToOpenMatch[_value];
+        om.player1.transfer(om.bet);
+        delete betToOpenMatch[_value];
+        emit OpenMatchCanceled(_value);
+    }
+
+
+
+    // ~~~~~~~~ Structs ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    struct OpenMatch {
+        address payable player1;
+        uint bet;
+    }
+
 }
 
-contract RockPaperScissorsInstance {
-
-    uint public stake = 1 wei;
-
-    enum Plays { Rock, Paper, Scissors, None }
-    enum Results { None, Player1, Player2, Draw }
-    enum Players { Player1, Player2 }
-
-    mapping(Plays => mapping(Plays => Results)) possibleResults;
-    mapping(Players => address payable) players;
-    mapping(Players => Plays) plays;
-    mapping(string => Plays) stringToPlay;
-
-    event MatchIsReady(uint readyMatchId, address payable player1, address payable player2);
-    event Result(Results outcome, address payable player1, address payable player2);
+contract RPSMatch {
 
 
 
-    constructor() {
-        possibleResults[Plays.Rock][Plays.Rock] = Results.Draw;
-        possibleResults[Plays.Rock][Plays.Paper] = Results.Player2;
-        possibleResults[Plays.Rock][Plays.Scissors] = Results.Player1;
-        possibleResults[Plays.Paper][Plays.Rock] = Results.Player1;
-        possibleResults[Plays.Paper][Plays.Paper] = Results.Draw;
-        possibleResults[Plays.Paper][Plays.Scissors] = Results.Player2;
-        possibleResults[Plays.Scissors][Plays.Rock] = Results.Player2;
-        possibleResults[Plays.Scissors][Plays.Paper] = Results.Player1;
-        possibleResults[Plays.Scissors][Plays.Scissors] = Results.Draw;
+    // ~~~~~~~~ State ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-        plays[Players.Player1] = Plays.None;
-        plays[Players.Player2] = Plays.None;
+    uint public index;
 
-        stringToPlay["R"] = Plays.Rock;
-        stringToPlay["P"] = Plays.Paper;
-        stringToPlay["S"] = Plays.Scissors;
+    enum GameStatus {Active, Canceled, Finished}
+    enum Move {None, Rock, Paper, Scissors}
+    enum Outcome {None, Player1, Player2, Draw}
+    mapping(Move => mapping(Move => Outcome)) resultHandler;
+
+    address payable player1;
+    address payable player2;
+    uint bet;
+    Outcome public outcome;
+    Move public player1Move;
+    Move public player2Move;
+    bytes32 public player1EncryptedMove;
+    bytes32 public player2EncryptedMove;
+    uint afterPlayTimeout;
+    uint currentTimeout;
+    GameStatus public status;
+
+
+
+    // ~~~~~~~~ Init ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    constructor(uint _index, address payable _player1, address payable _player2, uint _initialTimeout, uint _afterPlayTimeout, uint _bet){
+        index = _index;
+        player1 = _player1;
+        player2 = _player2;
+        currentTimeout = _initialTimeout;
+        afterPlayTimeout = _afterPlayTimeout;
+        bet = _bet;
+        outcome = Outcome.None;
+        status = GameStatus.Active;
+        createHandler();
     }
 
-    // Modifiers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+    // ~~~~~~~~ Events ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    event Result(string outcome);
+    event CanceledMatch();
+
+    // ~~~~~~~~ Mods ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     modifier isPlayer() {
-        require(msg.sender == players[Players.Player1] || msg.sender == players[Players.Player2],
-            "You are not playing this game."
-        );
+        require(msg.sender == player1 || msg.sender == player2, "You don't belong in this match");
         _;
     }
 
-    modifier isValidChoice(string memory _playerChoice) {
-        require(keccak256(bytes(_playerChoice)) == keccak256(bytes('R')) ||
-        keccak256(bytes(_playerChoice)) == keccak256(bytes('P')) ||
-            keccak256(bytes(_playerChoice)) == keccak256(bytes('S')) ,
-            "Your choice is not valid, it should be one of R, P and S."
-        );
+    modifier bothPlayed() {
+        require(player1EncryptedMove.length != 0 && player2EncryptedMove.length != 0, "Both players must play before revealing");
         _;
     }
 
-    modifier playersMadeChoice() {
-        require(plays[Players.Player1] != address(0) && plays[Players.Player2] != address(0),
-            "The player(s) have not made their choice yet."
-        );
+    modifier isMatchActive() {
+        require(status == GameStatus.Active, "Game is no longer active");
         _;
     }
 
-    // Functions ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    function validatePlayer(address add, Players player) {
-        return players[player] == add;
+
+    // ~~~~~~~~ Transactions ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    function createHandler() private {
+        resultHandler[Move.Rock][Move.Rock] = Outcome.Draw;
+        resultHandler[Move.Rock][Move.Paper] = Outcome.Player2;
+        resultHandler[Move.Rock][Move.Scissors] = Outcome.Player1;
+        resultHandler[Move.Paper][Move.Rock] = Outcome.Player1;
+        resultHandler[Move.Paper][Move.Paper] = Outcome.Draw;
+        resultHandler[Move.Paper][Move.Scissors] = Outcome.Player2;
+        resultHandler[Move.Scissors][Move.Rock] = Outcome.Player2;
+        resultHandler[Move.Scissors][Move.Paper] = Outcome.Player1;
+        resultHandler[Move.Scissors][Move.Scissors] = Outcome.Draw;
     }
 
-    function hasPlayed(Players player) {
-        return plays[player] != Plays.None;
-    }
+    fallback() external payable {}
 
-    function join() external payable
-    {
-        if (Players.Player1 == address(0)) {
-            Players.Player1 = msg.sender;
-        } else
-            Players.Player2 = msg.sender;
-    }
+    receive() external payable {}
 
-    function play(string calldata _playerChoice) external
-    isPlayer()
-    isValidChoice(_playerChoice)
-    {
-        if (validatePlayer(msg.sender, Players.Player1) && !hasPlayed(Players.Player1)) {
-            plays[Players.Player1] = _playerChoice;
-        } else if (validatePlayer(msg.sender, Players.Player2) && !hasPlayed(Players.Player2)) {
-            plays[Players.Player2] = _playerChoice;
+    function setPlay(bytes32 encryptedMove) public isPlayer isMatchActive {
+        if (hasMatchTimedOut()) {
+            cancelMatch();
+            return;
         }
-    }
-
-    function disclose() external
-    isPlayer()
-    playersMadeChoice()
-    {
-        Plays player1Play = plays[Players.Player1];
-        Plays player2Play = plays[Players.Player2];
-        int result = possibleResults[player1Play][player2Play];
-
-        if (result == Results.Draw) {
-            player1.transfer(stake);
-            player2.transfer(stake);
-        } else if (result == Results.Player1) {
-            player1.transfer(address(this).balance);
-        } else if (result == Results.Player2) {
-            player2.transfer(address(this).balance);
+        if (msg.sender == player1) {
+            player1EncryptedMove = encryptedMove;
         }
+        else {
+            player2EncryptedMove = encryptedMove;
+        }
+        currentTimeout = block.timestamp + afterPlayTimeout;
     }
 
+    function commitPlay(string memory play, string memory salt, bytes32 encryptedPlay) public isPlayer isMatchActive bothPlayed {
+        require(encryptedPlay == keccak256(abi.encodePacked(play, salt)), "Your encrypted play differs from the play you are trying yo commit");
+        if (payable(msg.sender) == player1) {
+            require(player1EncryptedMove == encryptedPlay, "Commits are not equal");
+            require(player1Move == Move.None, "Player has already revealed move");
+            bytes memory decodeMove = bytes(play);
+            player1Move = parseMoveFromBytes(decodeMove);
+        } else {
+            require(player2EncryptedMove == encryptedPlay, "Commits are not equal");
+            require(player2Move == Move.None, "Player has already revealed move");
+            bytes memory decodeMove = bytes(play);
+            player2Move = parseMoveFromBytes(decodeMove);
+        }
+        finishGame();
+    }
 
+    function parseMoveFromBytes(bytes memory _move) private pure returns (Move){
+        if (_move[0] == 'r') {
+            return Move.Rock;
+        }
+        if (_move[0] == 'p') {
+            return Move.Paper;
+        }
+        if (_move[0] == 's') {
+            return Move.Scissors;
+        }
+        return Move.None;
+    }
+
+    function bothPlayersCommitedTheirPlays() private returns(bool) {
+        return player1Move != Move.None && player2Move != Move.None;
+    }
+
+    function finishGame() private {
+        if(!bothPlayersCommitedTheirPlays()) return;
+
+        outcome = resultHandler[player1Move][player2Move];
+
+        if (outcome == Outcome.Player1) {
+            player1.transfer(bet * 2);
+            emit Result("Player 1 won!");
+        }
+        else if (outcome == Outcome.Player2) {
+            player2.transfer(bet * 2);
+            emit Result("Player 2 won!");
+        }
+        else if (outcome == Outcome.Draw) {
+            player2.transfer(bet);
+            player1.transfer(bet);
+            emit Result("Ganamos, perdimos, igual nos divetimos!!!! :D");
+        }
+        status = GameStatus.Finished;
+    }
+
+    function hasMatchTimedOut() view private returns (bool){
+        return block.timestamp >= currentTimeout;
+    }
+
+    function cancelMatch() private {
+        player1.transfer(bet);
+        player2.transfer(bet);
+        status = GameStatus.Canceled;
+        emit CanceledMatch();
+    }
+
+    // ~~~~~~~~ Structs ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    struct MoveData {
+        Move move;
+        bytes32 encryptedMove;
+    }
 }
