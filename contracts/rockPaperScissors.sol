@@ -13,7 +13,7 @@ contract RPSGame is Ownable {
     using SafeMath for uint;
 
     uint public BET_MIN = 1 wei;
-    uint SECOND_PLAY_TIMEOUT = 1 minutes;
+    uint SECOND_PLAY_TIMEOUT = 1 hours;
     uint FIRST_PLAY_TIMEOUT = 1 hours;
 
     bool matchCreationEnabled = true;
